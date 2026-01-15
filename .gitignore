@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+**/build/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# VS Code
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Data outputs
+*.csv
+
+# Python
+__pycache__/
+*.pyc
