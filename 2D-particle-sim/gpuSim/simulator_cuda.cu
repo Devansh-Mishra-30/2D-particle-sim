@@ -1,35 +1,44 @@
-// simulator_cuda.cu
-#include <iostream>
-#include <chrono>
 #include "simulator_cuda.cuh"
-#include <cmath>  // for sqrtf
+#include <cmath>
+#include <iostream>
 
-// CUDA kernel: integrate motion (gravity, velocity, position) and handle boundary bounce for each particle
-__global__ void integrateKernel(ParticleData* particles, std::size_t N, float dt,
-                                float gravityX, float gravityY, float boundaryR) {
+static inline void cudaCheck(cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        std::cerr << "CUDA error: " << msg << " | " << cudaGetErrorString(err) << "\n";
+        std::abort();
+    }
+}
+
+__global__ void integrateKernel(ParticleData* particles,
+                                std::size_t N,
+                                float dt,
+                                float gravityX,
+                                float gravityY,
+                                float boundaryR) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
+
     ParticleData& p = particles[i];
-    // Apply gravity to velocity
+
     p.vx += gravityX * dt;
     p.vy += gravityY * dt;
-    // Update position based on velocity
+
     p.px += p.vx * dt;
     p.py += p.vy * dt;
 
-    // Enforce circular boundary (center at 0,0) with elastic bounce
     float dist2 = p.px * p.px + p.py * p.py;
-    float maxRadius = boundaryR - p.radius;  // effective boundary radius for particle center
-    if (dist2 > maxRadius * maxRadius) {
+    float maxRadius = boundaryR - p.radius;
+    float maxR2 = maxRadius * maxRadius;
+
+    if (dist2 > maxR2) {
         float dist = sqrtf(dist2);
-        if (dist != 0.0f) {
-            // Normalized vector from center to particle position
+        if (dist > 0.0f) {
             float nx = p.px / dist;
             float ny = p.py / dist;
-            // Clamp position to boundary edge
+
             p.px = nx * maxRadius;
             p.py = ny * maxRadius;
-            // Reflect velocity (if moving outward, invert that component)
+
             float vDotN = p.vx * nx + p.vy * ny;
             if (vDotN > 0.0f) {
                 p.vx -= 2.0f * vDotN * nx;
@@ -39,35 +48,37 @@ __global__ void integrateKernel(ParticleData* particles, std::size_t N, float dt
     }
 }
 
-// CUDA kernel: detect overlaps and compute position offsets for particle-particle collisions
-__global__ void collideKernel(const ParticleData* particles, float* d_dx, float* d_dy, std::size_t N) {
+__global__ void collideKernel(const ParticleData* particles,
+                              float* d_dx,
+                              float* d_dy,
+                              std::size_t N) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-    // Each thread checks collisions of particle i with particles j > i
+
     float px_i = particles[i].px;
     float py_i = particles[i].py;
     float ri   = particles[i].radius;
+
     for (unsigned int j = i + 1; j < N; ++j) {
         float px_j = particles[j].px;
         float py_j = particles[j].py;
         float rj   = particles[j].radius;
-        // Compute squared distance between particle i and j
+
         float dx = px_j - px_i;
         float dy = py_j - py_i;
         float dist2 = dx * dx + dy * dy;
+
         float minDist = ri + rj;
-        if (dist2 < minDist * minDist) {
+        float minDist2 = minDist * minDist;
+
+        if (dist2 < minDist2) {
             float dist = sqrtf(dist2);
-            if (dist == 0.0f) {
-                // If particles are exactly overlapping, skip to avoid division by zero
-                continue;
-            }
-            // Calculate overlap distance beyond allowed separation
+            if (dist == 0.0f) continue;
+
             float overlap = 0.5f * (minDist - dist);
-            // Normalized direction from particle i to particle j
             float nx = dx / dist;
             float ny = dy / dist;
-            // Accumulate position adjustments for each particle (using atomics for thread safety)
+
             atomicAdd(&d_dx[i], -overlap * nx);
             atomicAdd(&d_dy[i], -overlap * ny);
             atomicAdd(&d_dx[j],  overlap * nx);
@@ -76,27 +87,32 @@ __global__ void collideKernel(const ParticleData* particles, float* d_dx, float*
     }
 }
 
-// CUDA kernel: apply collision offsets to particle positions and enforce boundary constraints again
-__global__ void applyOffsetsKernel(ParticleData* particles, float* d_dx, float* d_dy,
-                                   std::size_t N, float boundaryR) {
+__global__ void applyOffsetsKernel(ParticleData* particles,
+                                   const float* d_dx,
+                                   const float* d_dy,
+                                   std::size_t N,
+                                   float boundaryR) {
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
+
     ParticleData& p = particles[i];
-    // Apply accumulated positional adjustments from collisions
+
     p.px += d_dx[i];
     p.py += d_dy[i];
-    // (d_dx and d_dy are reset to 0 on the host between frames, so no need to clear here)
-    // Check boundary again in case collision resolution pushed particle outside
+
     float dist2 = p.px * p.px + p.py * p.py;
     float maxRadius = boundaryR - p.radius;
-    if (dist2 > maxRadius * maxRadius) {
+    float maxR2 = maxRadius * maxRadius;
+
+    if (dist2 > maxR2) {
         float dist = sqrtf(dist2);
-        if (dist != 0.0f) {
+        if (dist > 0.0f) {
             float nx = p.px / dist;
             float ny = p.py / dist;
+
             p.px = nx * maxRadius;
             p.py = ny * maxRadius;
-            // Reflect velocity if particle was pushed outwards
+
             float vDotN = p.vx * nx + p.vy * ny;
             if (vDotN > 0.0f) {
                 p.vx -= 2.0f * vDotN * nx;
@@ -106,79 +122,107 @@ __global__ void applyOffsetsKernel(ParticleData* particles, float* d_dx, float* 
     }
 }
 
-// Constructor: allocate device memory and copy initial particle data from host to device
-Simulator::Simulator(ParticleData* hostArray, std::size_t count, float boundaryRadius,
-                     float gravityX, float gravityY)
-    : particleCount(count), boundaryRadius(boundaryRadius),
-      gravityX(gravityX), gravityY(gravityY),
-      h_particles(hostArray) {
-    // Allocate device array for particles
-    cudaMalloc(&d_particles, particleCount * sizeof(ParticleData));
-    // Allocate device arrays for collision offsets
-    cudaMalloc(&d_dx, particleCount * sizeof(float));
-    cudaMalloc(&d_dy, particleCount * sizeof(float));
-    // Copy initial particle data from host to device
-    cudaMemcpy(d_particles, h_particles, particleCount * sizeof(ParticleData),
-               cudaMemcpyHostToDevice);
+Simulator::Simulator(ParticleData* hostArray,
+                     std::size_t count,
+                     float boundaryRadiusIn,
+                     float gravityXIn,
+                     float gravityYIn)
+    : particleCount(count),
+      boundaryRadius(boundaryRadiusIn),
+      gravityX(gravityXIn),
+      gravityY(gravityYIn),
+      h_particles(hostArray),
+      d_particles(nullptr),
+      d_dx(nullptr),
+      d_dy(nullptr),
+      stream(nullptr),
+      evStart(nullptr),
+      evStop(nullptr) {
+
+    cudaCheck(cudaStreamCreate(&stream), "cudaStreamCreate");
+
+    cudaCheck(cudaMalloc(&d_particles, particleCount * sizeof(ParticleData)), "cudaMalloc d_particles");
+    cudaCheck(cudaMalloc(&d_dx, particleCount * sizeof(float)), "cudaMalloc d_dx");
+    cudaCheck(cudaMalloc(&d_dy, particleCount * sizeof(float)), "cudaMalloc d_dy");
+
+    cudaCheck(cudaMemcpyAsync(d_particles,
+                              h_particles,
+                              particleCount * sizeof(ParticleData),
+                              cudaMemcpyHostToDevice,
+                              stream),
+              "cudaMemcpyAsync H2D particles");
+
+    cudaCheck(cudaMemsetAsync(d_dx, 0, particleCount * sizeof(float), stream), "cudaMemsetAsync d_dx");
+    cudaCheck(cudaMemsetAsync(d_dy, 0, particleCount * sizeof(float), stream), "cudaMemsetAsync d_dy");
+
+    cudaCheck(cudaEventCreate(&evStart), "cudaEventCreate start");
+    cudaCheck(cudaEventCreate(&evStop), "cudaEventCreate stop");
+
+    cudaCheck(cudaStreamSynchronize(stream), "cudaStreamSynchronize init");
 }
 
-// Destructor: free device memory
 Simulator::~Simulator() {
-    cudaFree(d_particles);
-    cudaFree(d_dx);
-    cudaFree(d_dy);
+    if (evStart) cudaEventDestroy(evStart);
+    if (evStop) cudaEventDestroy(evStop);
+    if (d_particles) cudaFree(d_particles);
+    if (d_dx) cudaFree(d_dx);
+    if (d_dy) cudaFree(d_dy);
+    if (stream) cudaStreamDestroy(stream);
 }
 
-void Simulator::update(float dt) {
-    // setup
+void Simulator::runKernels(float dt) {
     int threads = 256;
-    int blocks  = (particleCount + threads - 1) / threads;
+    int blocks = static_cast<int>((particleCount + threads - 1) / threads);
 
-    // time points
-    auto t_start = std::chrono::high_resolution_clock::now();
+    integrateKernel<<<blocks, threads, 0, stream>>>(d_particles, particleCount, dt,
+                                                   gravityX, gravityY, boundaryRadius);
+    cudaCheck(cudaGetLastError(), "integrateKernel launch");
 
-    // 1. integrate + boundary
-    integrateKernel<<<blocks, threads>>>(d_particles, particleCount, dt,
-                                         gravityX, gravityY, boundaryRadius);
-    cudaDeviceSynchronize();
-    auto t1 = std::chrono::high_resolution_clock::now();
+    cudaCheck(cudaMemsetAsync(d_dx, 0, particleCount * sizeof(float), stream), "cudaMemsetAsync d_dx");
+    cudaCheck(cudaMemsetAsync(d_dy, 0, particleCount * sizeof(float), stream), "cudaMemsetAsync d_dy");
 
-    // 2. reset offsets
-    cudaMemset(d_dx, 0, particleCount * sizeof(float));
-    cudaMemset(d_dy, 0, particleCount * sizeof(float));
+    collideKernel<<<blocks, threads, 0, stream>>>(d_particles, d_dx, d_dy, particleCount);
+    cudaCheck(cudaGetLastError(), "collideKernel launch");
 
-    // 3. collision detection
-    collideKernel<<<blocks, threads>>>(d_particles, d_dx, d_dy, particleCount);
-    cudaDeviceSynchronize();
-    auto t2 = std::chrono::high_resolution_clock::now();
-
-    // 4. apply offsets + boundary
-    applyOffsetsKernel<<<blocks, threads>>>(d_particles, d_dx, d_dy,
-                                            particleCount, boundaryRadius);
-    cudaDeviceSynchronize();
-    auto t3 = std::chrono::high_resolution_clock::now();
-
-    // 5. copy back for rendering
-    cudaMemcpy(h_particles, d_particles, particleCount * sizeof(ParticleData),
-               cudaMemcpyDeviceToHost);
-    auto t4 = std::chrono::high_resolution_clock::now();
-
-    // compute durations
-    std::chrono::duration<double,std::milli> dtIntegrate = t1 - t_start;
-    std::chrono::duration<double,std::milli> dtCollide   = t2 - t1;
-    std::chrono::duration<double,std::milli> dtApply     = t3 - t2;
-    std::chrono::duration<double,std::milli> dtMemcpy    = t4 - t3;
-
-    // print out
-    static bool header_done = false;
-    if (!header_done) {
-        std::cout << "Integrate,Collide,ApplyOffsets,HostMemcpy\n";
-        header_done = true;
-    }
-    std::cout
-        << dtIntegrate.count() << ","
-        << dtCollide.count()   << ","
-        << dtApply.count()     << ","
-        << dtMemcpy.count()    << "\n";
+    applyOffsetsKernel<<<blocks, threads, 0, stream>>>(d_particles, d_dx, d_dy, particleCount, boundaryRadius);
+    cudaCheck(cudaGetLastError(), "applyOffsetsKernel launch");
 }
 
+void Simulator::copyToHost() {
+    cudaCheck(cudaMemcpyAsync(h_particles,
+                              d_particles,
+                              particleCount * sizeof(ParticleData),
+                              cudaMemcpyDeviceToHost,
+                              stream),
+              "cudaMemcpyAsync D2H particles");
+    cudaCheck(cudaStreamSynchronize(stream), "cudaStreamSynchronize copyToHost");
+}
+
+void Simulator::update(float dt, bool syncToHost) {
+    runKernels(dt);
+    if (syncToHost) {
+        copyToHost();
+        return;
+    }
+}
+
+float Simulator::benchmarkSteps(float dt, int warmupSteps, int measuredSteps) {
+    if (warmupSteps < 0) warmupSteps = 0;
+    if (measuredSteps <= 0) measuredSteps = 1;
+
+    for (int i = 0; i < warmupSteps; ++i) {
+        runKernels(dt);
+    }
+    cudaCheck(cudaStreamSynchronize(stream), "warmup sync");
+
+    cudaCheck(cudaEventRecord(evStart, stream), "event record start");
+    for (int i = 0; i < measuredSteps; ++i) {
+        runKernels(dt);
+    }
+    cudaCheck(cudaEventRecord(evStop, stream), "event record stop");
+    cudaCheck(cudaEventSynchronize(evStop), "event sync stop");
+
+    float ms = 0.0f;
+    cudaCheck(cudaEventElapsedTime(&ms, evStart, evStop), "event elapsed time");
+    return ms / static_cast<float>(measuredSteps);
+}

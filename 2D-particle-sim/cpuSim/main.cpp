@@ -253,7 +253,7 @@ int main(int argc, char* argv[]) {
     const float init_velocity_max   = 500.0f;
     const float init_velocity_min   = -500.0f;
 
-    const sf::Vector2Sf born_position(boundary_center);
+    const sf::Vector2f born_position(boundary_center);
     const sf::Vector2f gravity(0.0f, -980.0f);
 
     const int frame_rate = 60;

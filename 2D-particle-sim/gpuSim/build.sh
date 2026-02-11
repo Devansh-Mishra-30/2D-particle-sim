@@ -1,6 +1,6 @@
 #!/bin/bash
+set -e
 
-mkdir build
-cd build
-cmake -S .. -B .
-cmake --build .
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+echo "Built: build/particle_sim"

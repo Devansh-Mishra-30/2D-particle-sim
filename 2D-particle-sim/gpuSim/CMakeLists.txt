@@ -1,36 +1,42 @@
-cmake_minimum_required(VERSION 3.10)
-set(PROJECT_NAME simulator)
-project(${PROJECT_NAME} LANGUAGES CXX CUDA)
+cmake_minimum_required(VERSION 3.18)
 
-# Use C++17 standard
+project(particle_sim LANGUAGES CXX CUDA)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Enable all warnings and set O3 optimizations
-set(CMAKE_CXX_FLAGS "-Wall -O3")
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
-
-# Enable CUDA if available
-enable_language(CUDA)
-add_definitions(-DUSE_CUDA)
-
-# Detect and add SFML
-set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake_modules" ${CMAKE_MODULE_PATH})
 find_package(SFML 3 REQUIRED COMPONENTS Graphics Window System)
 
-# Include directories
-include_directories(. ${SFML_INCLUDE_DIRS} ${CUDA_INCLUDE_DIRS})
-
-# Source files (REMOVE simulator_gpu.cpp)
-# Source files
-set(SOURCES
-    main.cpp
-    renderer.cpp
-    simulator_cuda.cu
+add_executable(particle_sim
+  main.cpp
+  renderer.cpp
+  simulator_cuda.cu
 )
 
-# Specify the executable
-add_executable(${PROJECT_NAME} ${SOURCES})
+target_include_directories(particle_sim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Link SFML libraries
-target_link_libraries(${PROJECT_NAME} SFML::Graphics SFML::Window SFML::System)
+target_link_libraries(particle_sim PRIVATE SFML::Graphics SFML::Window SFML::System)
+
+# Warnings and optimization per build type
+target_compile_options(particle_sim PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+)
+
+# CUDA settings
+set_target_properties(particle_sim PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+# If you want explicit arch, set it here.
+# For example, sm_89:
+# set(CMAKE_CUDA_ARCHITECTURES 89)
+# Better: use native on newer CMake/NVIDIA toolchains if supported:
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
